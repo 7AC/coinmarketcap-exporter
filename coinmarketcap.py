@@ -1,8 +1,7 @@
 from prometheus_client import start_http_server, Metric, REGISTRY
 from threading import Lock
 from cachetools import cached, TTLCache
-from requests import Request, Session
-from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
+from requests import Session
 import argparse
 import json
 import logging
@@ -22,6 +21,7 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 ch.setFormatter(formatter)
 log.addHandler(ch)
 
+symbol = os.environ.get('SYMBOL', 'XCH')
 currency = os.environ.get('CURRENCY', 'USD')
 cak = os.environ.get('COINMARKETCAP_API_KEY')
 # caching API for 50min
@@ -31,49 +31,35 @@ cache_max_size = int(os.environ.get('CACHE_MAX_SIZE', 10000))
 cache = TTLCache(maxsize=cache_max_size, ttl=cache_ttl)
 
 class CoinClient():
-  def __init__(self):
-
-    self.url = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest'
+  def __init__(self, symbol):
+    self.symbol = symbol
+    self.url = f'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol={symbol}'
     self.headers = {'Accepts': 'application/json', 'X-CMC_PRO_API_KEY': cak}
-    self.parameters = {'start': '1', 'limit': '5000', 'convert': currency}
 
   @cached(cache)
-  def tickers(self):
+  def quote(self):
     log.info('Fetching data from the API')
     session = Session()
     session.headers.update(self.headers)
-    r = session.get(self.url, params=self.parameters)
+    r = session.get(self.url)
     data = json.loads(r.text)
     if 'data' not in data:
       log.error('No data in response. Is your API key set?')
-      log.info(data)
     return data
 
 class CoinCollector():
-  def __init__(self):
-    self.client = CoinClient()
+  def __init__(self, symbol):
+    self.client = CoinClient(symbol=symbol)
+    self.symbol = symbol
 
   def collect(self):
     with lock:
-      log.info('collecting...')
       # query the api
-      response = self.client.tickers()
-      metric = Metric('coin_market', 'coinmarketcap metric values', 'gauge')
-      if 'data' not in response:
-        log.error('No data in response. Is your API key set?')
-      else:
-        for value in response['data']:
-          for that in ['cmc_rank', 'total_supply', 'max_supply', 'circulating_supply']:
-            coinmarketmetric = '_'.join(['coin_market', that])
-            if value[that] is not None:
-              metric.add_sample(coinmarketmetric, value=float(value[that]), labels={'id': value['slug'], 'name': value['name'], 'symbol': value['symbol']})
-          for price in [currency]:
-            for that in ['price', 'volume_24h', 'market_cap', 'percent_change_1h', 'percent_change_24h', 'percent_change_7d']:
-              coinmarketmetric = '_'.join(['coin_market', that, price]).lower()
-              if value['quote'][price] is None:
-                continue
-              if value['quote'][price][that] is not None:
-                metric.add_sample(coinmarketmetric, value=float(value['quote'][price][that]), labels={'id': value['slug'], 'name': value['name'], 'symbol': value['symbol']})
+      response = self.client.quote()
+      metric = Metric('coin_market_quote', 'coinmarketcap quote', 'gauge')
+      coinmarketmetric = f'coin_market_quote_{currency}'
+      quote = response['data'][self.symbol]['quote'][currency]
+      metric.add_sample(coinmarketmetric, value=float(quote['price']), labels={'symbol': self.symbol})
       yield metric
 
 if __name__ == '__main__':
@@ -84,7 +70,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     log.info('listening on http://%s:%d/metrics' % (args.addr, args.port))
 
-    REGISTRY.register(CoinCollector())
+    REGISTRY.register(CoinCollector(symbol=symbol))
     start_http_server(int(args.port), addr=args.addr)
 
     while True:
